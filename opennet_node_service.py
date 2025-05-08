@@ -17,13 +17,15 @@ from cryptography.fernet import Fernet
 app = Flask(__name__)
 
 NODE_ID = os.getenv("NODE_ID", "node1")
-VALIDATORS = os.getenv("VALIDATORS", "node1,node2,node3,node4").split(',')
+VALIDATORS = os.getenv("VALIDATORS", "node1,node2,node3").split(',')
 NODE_ROLE = os.getenv("NODE_ROLE", "account")
 LEDGER_FILE = f"ledger_{NODE_ID}.json"
 PEERS = os.getenv("PEERS", "").split(',')
 TREASURY_ADDR = "open_treasury_001"
 GENESIS_SUPPLY = 500_000_000
 FEE_RATE = 0.002
+KEYSTORE_DIR = Path("keystore")
+KEYSTORE_DIR.mkdir(exist_ok=True)
 
 ledger_data = {
     "chain": [],
@@ -53,7 +55,32 @@ def get_balance(address):
 def sync_chain():
     return jsonify({"status": "sync complete", "length": len(ledger_data["chain"])})
 
-# CLI Tool: Wallet Gen, TX Sign, TX Send, Encrypted Keystore
+@app.route("/faucet", methods=["POST"])
+def faucet():
+    data = request.get_json()
+    address = data.get("address")
+    amount = float(data.get("amount", 0))
+
+    if not address or amount <= 0:
+        return jsonify({"error": "Invalid request"}), 400
+
+    treasury = ledger_data["balances"].get(TREASURY_ADDR, 0)
+    if treasury < amount:
+        return jsonify({"error": "Insufficient treasury funds"}), 403
+
+    ledger_data["balances"][TREASURY_ADDR] -= amount
+    ledger_data["balances"][address] = ledger_data["balances"].get(address, 0) + amount
+
+    faucet_tx = {
+        "sender": TREASURY_ADDR,
+        "receiver": address,
+        "amount": amount,
+        "timestamp": time.time(),
+        "type": "faucet"
+    }
+    ledger_data["ledger"].append(faucet_tx)
+    return jsonify({"status": "faucet granted", "tx": faucet_tx})
+
 if __name__ == '__main__':
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "gen-wallet":
