@@ -40,8 +40,32 @@ def get_chain():
 @app.route("/tx", methods=["POST"])
 def submit_transaction():
     tx = request.json
+    sender = tx.get("sender")
+    receiver = tx.get("receiver")
+    amount = float(tx.get("amount", 0))
+
+    if not sender or not receiver or amount <= 0:
+        return jsonify({"error": "Invalid transaction format"}), 400
+
+    sender_balance = ledger_data["balances"].get(sender, 0.0)
+    if sender_balance < amount:
+        return jsonify({"error": "Insufficient funds"}), 403
+
+    fee = amount * FEE_RATE
+    net_amount = amount - fee
+
+    # Update balances
+    ledger_data["balances"][sender] -= amount
+    ledger_data["balances"][receiver] = ledger_data["balances"].get(receiver, 0.0) + net_amount
+
+    eligible_validators = [v for v in VALIDATORS if v != NODE_ID]
+    if eligible_validators:
+        fee_share = fee / len(eligible_validators)
+        for v in eligible_validators:
+            ledger_data["balances"][v] = ledger_data["balances"].get(v, 0.0) + fee_share
+
     ledger_data["ledger"].append(tx)
-    return jsonify({"status": "accepted"})
+    return jsonify({"status": "accepted", "tx": tx})
 
 @app.route("/index", methods=["GET"])
 def get_indexed():
