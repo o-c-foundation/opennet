@@ -25,10 +25,33 @@ TREASURY_ADDR = "open_treasury_001"
 GENESIS_SUPPLY = 500_000_000
 FEE_RATE = 0.002
 
-FAUCET_HISTORY = defaultdict(list)
-FAUCET_LIMIT_SECONDS = 3600
-KEYSTORE_DIR = Path("keystore")
-KEYSTORE_DIR.mkdir(exist_ok=True)
+ledger_data = {
+    "chain": [],
+    "ledger": [],
+    "balances": {TREASURY_ADDR: GENESIS_SUPPLY},
+}
+
+@app.route("/chain", methods=["GET"])
+def get_chain():
+    return jsonify(ledger_data["chain"])
+
+@app.route("/tx", methods=["POST"])
+def submit_transaction():
+    tx = request.json
+    ledger_data["ledger"].append(tx)
+    return jsonify({"status": "accepted"})
+
+@app.route("/index", methods=["GET"])
+def get_indexed():
+    return jsonify({"role": NODE_ROLE, "data": ledger_data["ledger"]})
+
+@app.route("/balance/<address>", methods=["GET"])
+def get_balance(address):
+    return jsonify({"address": address, "balance": ledger_data["balances"].get(address, 0.0)})
+
+@app.route("/sync", methods=["POST"])
+def sync_chain():
+    return jsonify({"status": "sync complete", "length": len(ledger_data["chain"])})
 
 # CLI Tool: Wallet Gen, TX Sign, TX Send, Encrypted Keystore
 if __name__ == '__main__':
