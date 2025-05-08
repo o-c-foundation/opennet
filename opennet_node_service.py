@@ -33,6 +33,11 @@ ledger_data = {
     "balances": {TREASURY_ADDR: GENESIS_SUPPLY},
 }
 
+# Load persistent ledger if it exists
+if os.path.exists(LEDGER_FILE):
+    with open(LEDGER_FILE, 'r') as f:
+        ledger_data.update(json.load(f))
+
 @app.route("/chain", methods=["GET"])
 def get_chain():
     return jsonify(ledger_data["chain"])
@@ -54,7 +59,6 @@ def submit_transaction():
     fee = amount * FEE_RATE
     net_amount = amount - fee
 
-    # Update balances
     ledger_data["balances"][sender] -= amount
     ledger_data["balances"][receiver] = ledger_data["balances"].get(receiver, 0.0) + net_amount
 
@@ -65,11 +69,33 @@ def submit_transaction():
             ledger_data["balances"][v] = ledger_data["balances"].get(v, 0.0) + fee_share
 
     ledger_data["ledger"].append(tx)
+    with open(LEDGER_FILE, 'w') as f:
+        json.dump(ledger_data, f)
     return jsonify({"status": "accepted", "tx": tx})
+
+@app.route("/mine", methods=["POST"])
+def mine_block():
+    if not ledger_data["ledger"]:
+        return jsonify({"error": "No transactions to mine"}), 400
+
+    block = {
+        "index": len(ledger_data["chain"]),
+        "timestamp": time.time(),
+        "transactions": ledger_data["ledger"][:],
+        "miner": NODE_ID,
+    }
+    block_string = json.dumps(block, sort_keys=True).encode()
+    block["hash"] = hashlib.sha256(block_string).hexdigest()
+    ledger_data["chain"].append(block)
+    ledger_data["ledger"] = []
+    with open(LEDGER_FILE, 'w') as f:
+        json.dump(ledger_data, f)
+    return jsonify({"status": "block mined", "block": block})
 
 @app.route("/index", methods=["GET"])
 def get_indexed():
-    return jsonify({"role": NODE_ROLE, "data": ledger_data["ledger"]})
+    latest = ledger_data["ledger"][-20:] if len(ledger_data["ledger"]) > 20 else ledger_data["ledger"]
+    return jsonify({"role": NODE_ROLE, "data": latest})
 
 @app.route("/balance/<address>", methods=["GET"])
 def get_balance(address):
@@ -103,7 +129,24 @@ def faucet():
         "type": "faucet"
     }
     ledger_data["ledger"].append(faucet_tx)
+    with open(LEDGER_FILE, 'w') as f:
+        json.dump(ledger_data, f)
     return jsonify({"status": "faucet granted", "tx": faucet_tx})
+
+@app.route("/fullsync", methods=["POST"])
+def full_sync():
+    for peer in PEERS:
+        try:
+            chain = requests.get(f"{peer}/chain").json()
+            ledger = requests.get(f"{peer}/index").json()
+            if len(chain) > len(ledger_data["chain"]):
+                ledger_data["chain"] = chain
+                ledger_data["ledger"] = ledger.get("data", [])
+                with open(LEDGER_FILE, 'w') as f:
+                    json.dump(ledger_data, f)
+        except Exception:
+            continue
+    return jsonify({"status": "full sync complete"})
 
 if __name__ == '__main__':
     import sys
