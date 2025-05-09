@@ -1,7 +1,7 @@
-# opennet_node_service.py
 import hashlib
 import json
 import os
+import random
 import time
 import requests
 from flask import Flask, request, jsonify
@@ -19,6 +19,8 @@ PEERS = os.getenv("PEERS", "").split(',')
 TREASURY_ADDR = "open_treasury_001"
 GENESIS_SUPPLY = 500_000_000
 FEE_RATE = 0.002
+CONTRACT_DEPLOY_FEE = 5.0
+WHITELISTED_DEPLOYERS = {"open_treasury_001"}
 LEDGER_FILE = f"ledger_{NODE_ID}.json"
 KEYSTORE_DIR = Path("keystore")
 KEYSTORE_DIR.mkdir(exist_ok=True)
@@ -26,7 +28,8 @@ KEYSTORE_DIR.mkdir(exist_ok=True)
 ledger_data = {
     "chain": [],
     "ledger": [],
-    "balances": {TREASURY_ADDR: GENESIS_SUPPLY}
+    "balances": {TREASURY_ADDR: GENESIS_SUPPLY},
+    "contracts": {}
 }
 
 if os.path.exists(LEDGER_FILE):
@@ -37,8 +40,8 @@ def verify_signature(tx):
     try:
         pubkey_hex = tx.get("pubkey")
         sender = tx.get("sender")
-        receiver = tx.get("receiver")
-        amount = float(tx.get("amount"))
+        receiver = tx.get("receiver", "")
+        amount = float(tx.get("amount", 0))
         timestamp = tx.get("timestamp")
         signature = tx.get("signature")
 
@@ -133,6 +136,68 @@ def faucet():
     with open(LEDGER_FILE, 'w') as f:
         json.dump(ledger_data, f)
     return jsonify({"status": "faucet granted", "tx": faucet_tx})
+
+@app.route("/deploy_contract", methods=["POST"])
+def deploy_contract():
+    data = request.get_json()
+    creator = data.get("creator")
+    code = data.get("code")
+    timestamp = data.get("timestamp")
+    signature = data.get("signature")
+    pubkey = data.get("pubkey")
+
+    if creator not in WHITELISTED_DEPLOYERS:
+        return jsonify({"error": "creator not whitelisted"}), 403
+
+    deploy_tx = {
+        "sender": creator,
+        "receiver": "",
+        "amount": CONTRACT_DEPLOY_FEE,
+        "timestamp": timestamp,
+        "signature": signature,
+        "pubkey": pubkey
+    }
+
+    if not verify_signature(deploy_tx):
+        return jsonify({"error": "Invalid deploy signature"}), 403
+
+    if ledger_data["balances"].get(creator, 0) < CONTRACT_DEPLOY_FEE:
+        return jsonify({"error": "Insufficient funds"}), 403
+
+    ledger_data["balances"][creator] -= CONTRACT_DEPLOY_FEE
+
+    contract_id = "open_contract_" + hashlib.sha256(f"{creator}{timestamp}".encode()).hexdigest()[:24]
+    ledger_data["contracts"][contract_id] = code
+
+    ledger_data["ledger"].append({
+        "type": "contract_deploy",
+        "creator": creator,
+        "address": contract_id,
+        "code": code,
+        "timestamp": timestamp
+    })
+    with open(LEDGER_FILE, 'w') as f:
+        json.dump(ledger_data, f)
+
+    return jsonify({"status": "deployed", "contract": contract_id})
+
+@app.route("/call_contract", methods=["POST"])
+def call_contract():
+    data = request.get_json()
+    contract_id = data.get("contract")
+    input_data = data.get("input")
+
+    code = ledger_data["contracts"].get(contract_id)
+    if not code:
+        return jsonify({"error": "contract not found"}), 404
+
+    try:
+        exec_env = {}
+        exec(f"def run(input):\n    {code.replace(chr(10), chr(10)+'    ')}", exec_env)
+        result = exec_env['run'](input_data)
+        return jsonify({"contract": contract_id, "result": result})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
 
 @app.route("/mine", methods=["POST"])
 def mine_block():
