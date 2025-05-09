@@ -6,10 +6,8 @@ import os
 import random
 import time
 import requests
-from typing import List, Dict
 from flask import Flask, request, jsonify
 from ecdsa import SigningKey, VerifyingKey, SECP256k1, BadSignatureError
-from collections import defaultdict
 from pathlib import Path
 from getpass import getpass
 from cryptography.fernet import Fernet
@@ -19,28 +17,23 @@ app = Flask(__name__)
 NODE_ID = os.getenv("NODE_ID", "node1")
 VALIDATORS = os.getenv("VALIDATORS", "node1,node2,node3").split(',')
 NODE_ROLE = os.getenv("NODE_ROLE", "account")
-LEDGER_FILE = f"ledger_{NODE_ID}.json"
 PEERS = os.getenv("PEERS", "").split(',')
 TREASURY_ADDR = "open_treasury_001"
 GENESIS_SUPPLY = 500_000_000
 FEE_RATE = 0.002
+LEDGER_FILE = f"ledger_{NODE_ID}.json"
 KEYSTORE_DIR = Path("keystore")
 KEYSTORE_DIR.mkdir(exist_ok=True)
 
 ledger_data = {
     "chain": [],
     "ledger": [],
-    "balances": {TREASURY_ADDR: GENESIS_SUPPLY},
+    "balances": {TREASURY_ADDR: GENESIS_SUPPLY}
 }
 
-# Load persistent ledger if it exists
 if os.path.exists(LEDGER_FILE):
     with open(LEDGER_FILE, 'r') as f:
         ledger_data.update(json.load(f))
-
-@app.route("/chain", methods=["GET"])
-def get_chain():
-    return jsonify(ledger_data["chain"])
 
 @app.route("/tx", methods=["POST"])
 def submit_transaction():
@@ -84,26 +77,67 @@ def mine_block():
         "transactions": ledger_data["ledger"][:],
         "miner": NODE_ID,
     }
-    block_string = json.dumps(block, sort_keys=True).encode()
-    block["hash"] = hashlib.sha256(block_string).hexdigest()
+    block["hash"] = hashlib.sha256(json.dumps(block, sort_keys=True).encode()).hexdigest()
     ledger_data["chain"].append(block)
     ledger_data["ledger"] = []
     with open(LEDGER_FILE, 'w') as f:
         json.dump(ledger_data, f)
+
+    for peer in PEERS:
+        try:
+            requests.post(f"{peer}/receive_block", json=block, timeout=3)
+        except Exception:
+            continue
+
     return jsonify({"status": "block mined", "block": block})
+
+@app.route("/receive_block", methods=["POST"])
+def receive_block():
+    new_block = request.json
+    if not new_block:
+        return jsonify({"error": "No block data"}), 400
+
+    if new_block["index"] == len(ledger_data["chain"]):
+        expected_hash = hashlib.sha256(json.dumps({k: v for k, v in new_block.items() if k != "hash"}, sort_keys=True).encode()).hexdigest()
+        if new_block["hash"] == expected_hash:
+            ledger_data["chain"].append(new_block)
+            ledger_data["ledger"] = []
+            with open(LEDGER_FILE, 'w') as f:
+                json.dump(ledger_data, f)
+            return jsonify({"status": "block accepted"})
+
+    return jsonify({"status": "ignored"})
+
+@app.route("/fullsync", methods=["POST"])
+def full_sync():
+    longest = ledger_data["chain"]
+    for peer in PEERS:
+        try:
+            remote_chain = requests.get(f"{peer}/chain").json()
+            if len(remote_chain) > len(longest):
+                longest = remote_chain
+        except Exception:
+            continue
+
+    if len(longest) > len(ledger_data["chain"]):
+        ledger_data["chain"] = longest
+        ledger_data["ledger"] = []
+        with open(LEDGER_FILE, 'w') as f:
+            json.dump(ledger_data, f)
+
+    return jsonify({"status": "synced", "length": len(ledger_data["chain"])})
+
+@app.route("/chain", methods=["GET"])
+def get_chain():
+    return jsonify(ledger_data["chain"])
 
 @app.route("/index", methods=["GET"])
 def get_indexed():
-    latest = ledger_data["ledger"][-20:] if len(ledger_data["ledger"]) > 20 else ledger_data["ledger"]
-    return jsonify({"role": NODE_ROLE, "data": latest})
+    return jsonify({"role": NODE_ROLE, "data": ledger_data["ledger"][-20:]})
 
 @app.route("/balance/<address>", methods=["GET"])
 def get_balance(address):
     return jsonify({"address": address, "balance": ledger_data["balances"].get(address, 0.0)})
-
-@app.route("/sync", methods=["POST"])
-def sync_chain():
-    return jsonify({"status": "sync complete", "length": len(ledger_data["chain"])})
 
 @app.route("/faucet", methods=["POST"])
 def faucet():
@@ -133,98 +167,48 @@ def faucet():
         json.dump(ledger_data, f)
     return jsonify({"status": "faucet granted", "tx": faucet_tx})
 
-@app.route("/fullsync", methods=["POST"])
-def full_sync():
-    for peer in PEERS:
-        try:
-            chain = requests.get(f"{peer}/chain").json()
-            ledger = requests.get(f"{peer}/index").json()
-            if len(chain) > len(ledger_data["chain"]):
-                ledger_data["chain"] = chain
-                ledger_data["ledger"] = ledger.get("data", [])
-                with open(LEDGER_FILE, 'w') as f:
-                    json.dump(ledger_data, f)
-        except Exception:
-            continue
-    return jsonify({"status": "full sync complete"})
-
 if __name__ == '__main__':
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "gen-wallet":
-        prefix = "open"
-        attempt = 0
-        while True:
-            key = SigningKey.generate(curve=SECP256k1)
-            pubkey = key.get_verifying_key().to_string().hex()
-            addr_hash = hashlib.sha256(pubkey.encode()).hexdigest()
-            address = "open" + addr_hash[:36]
-            attempt += 1
-            if address.startswith(prefix):
-                print("Address:", address)
-                print("Public Key:", pubkey)
-                print("Private Key:", key.to_string().hex())
-                pw = getpass("Encrypt and save key (y/N)? ").lower()
-                if pw == 'y':
-                    password = getpass("Set password: ").encode()
-                    fkey = Fernet.generate_key()
-                    f = Fernet(fkey)
-                    encrypted = f.encrypt(key.to_string())
-                    with open(KEYSTORE_DIR / f"{address}.key", "wb") as kf:
-                        kf.write(encrypted)
-                    with open(KEYSTORE_DIR / f"{address}.pw", "wb") as pf:
-                        pf.write(fkey)
-                    print(f"Wallet saved to keystore/{address}.key")
-                break
-
+        key = SigningKey.generate(curve=SECP256k1)
+        pubkey = key.get_verifying_key().to_string().hex()
+        addr_hash = hashlib.sha256(pubkey.encode()).hexdigest()
+        address = "open" + addr_hash[:36]
+        print("Address:", address)
+        print("Public Key:", pubkey)
+        print("Private Key:", key.to_string().hex())
     elif len(sys.argv) > 1 and sys.argv[1] == "sign-tx":
-        if len(sys.argv) != 6:
-            print("Usage: sign-tx <private_key> <sender> <receiver> <amount>")
-            sys.exit(1)
-        try:
-            priv_hex, sender, receiver, amount = sys.argv[2:6]
-            key = SigningKey.from_string(bytes.fromhex(priv_hex), curve=SECP256k1)
-            pubkey = key.get_verifying_key().to_string().hex()
-            timestamp = time.time()
-            message = f"{sender}:{receiver}:{amount}:{timestamp}".encode()
-            signature = key.sign(message).hex()
-            tx = {
-                "sender": sender,
-                "receiver": receiver,
-                "amount": float(amount),
-                "timestamp": timestamp,
-                "signature": signature,
-                "pubkey": pubkey
-            }
-            print(json.dumps(tx, indent=2))
-        except (ValueError, IndexError) as e:
-            print("Error: Invalid arguments or formatting.")
-            print("Usage: sign-tx <private_key> <sender> <receiver> <amount>")
-            sys.exit(1)
-
+        priv_hex, sender, receiver, amount = sys.argv[2:6]
+        key = SigningKey.from_string(bytes.fromhex(priv_hex), curve=SECP256k1)
+        pubkey = key.get_verifying_key().to_string().hex()
+        timestamp = time.time()
+        message = f"{sender}:{receiver}:{amount}:{timestamp}".encode()
+        signature = key.sign(message).hex()
+        tx = {
+            "sender": sender,
+            "receiver": receiver,
+            "amount": float(amount),
+            "timestamp": timestamp,
+            "signature": signature,
+            "pubkey": pubkey
+        }
+        print(json.dumps(tx, indent=2))
     elif len(sys.argv) > 1 and sys.argv[1] == "send-tx":
-        if len(sys.argv) != 7:
-            print("Usage: send-tx <private_key> <sender> <receiver> <amount> <node_url>")
-            sys.exit(1)
-        try:
-            priv_hex, sender, receiver, amount, node_url = sys.argv[2:7]
-            key = SigningKey.from_string(bytes.fromhex(priv_hex), curve=SECP256k1)
-            pubkey = key.get_verifying_key().to_string().hex()
-            timestamp = time.time()
-            message = f"{sender}:{receiver}:{amount}:{timestamp}".encode()
-            signature = key.sign(message).hex()
-            tx = {
-                "sender": sender,
-                "receiver": receiver,
-                "amount": float(amount),
-                "timestamp": timestamp,
-                "signature": signature,
-                "pubkey": pubkey
-            }
-            res = requests.post(f"{node_url}/tx", json=tx)
-            print("Node Response:", res.status_code, res.json())
-        except Exception as e:
-            print("Failed to send transaction:", str(e))
-            sys.exit(1)
-
+        priv_hex, sender, receiver, amount, node_url = sys.argv[2:7]
+        key = SigningKey.from_string(bytes.fromhex(priv_hex), curve=SECP256k1)
+        pubkey = key.get_verifying_key().to_string().hex()
+        timestamp = time.time()
+        message = f"{sender}:{receiver}:{amount}:{timestamp}".encode()
+        signature = key.sign(message).hex()
+        tx = {
+            "sender": sender,
+            "receiver": receiver,
+            "amount": float(amount),
+            "timestamp": timestamp,
+            "signature": signature,
+            "pubkey": pubkey
+        }
+        res = requests.post(f"{node_url}/tx", json=tx)
+        print("Node Response:", res.status_code, res.json())
     else:
         app.run(host="0.0.0.0", port=8000)
