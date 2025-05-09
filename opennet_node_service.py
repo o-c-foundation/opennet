@@ -1,9 +1,7 @@
 # opennet_node_service.py
-
 import hashlib
 import json
 import os
-import random
 import time
 import requests
 from flask import Flask, request, jsonify
@@ -35,15 +33,41 @@ if os.path.exists(LEDGER_FILE):
     with open(LEDGER_FILE, 'r') as f:
         ledger_data.update(json.load(f))
 
+def verify_signature(tx):
+    try:
+        pubkey_hex = tx.get("pubkey")
+        sender = tx.get("sender")
+        receiver = tx.get("receiver")
+        amount = float(tx.get("amount"))
+        timestamp = tx.get("timestamp")
+        signature = tx.get("signature")
+
+        pubkey_bytes = bytes.fromhex(pubkey_hex)
+        verifying_key = VerifyingKey.from_string(pubkey_bytes, curve=SECP256k1)
+        message = f"{sender}:{receiver}:{amount}:{timestamp}".encode()
+        verifying_key.verify(bytes.fromhex(signature), message)
+
+        derived_addr = "open" + hashlib.sha256(pubkey_bytes).hexdigest()[:36]
+        return derived_addr == sender
+
+    except (ValueError, BadSignatureError, TypeError):
+        return False
+
 @app.route("/tx", methods=["POST"])
 def submit_transaction():
     tx = request.json
     sender = tx.get("sender")
     receiver = tx.get("receiver")
     amount = float(tx.get("amount", 0))
+    timestamp = tx.get("timestamp")
+    signature = tx.get("signature")
+    pubkey_hex = tx.get("pubkey")
 
-    if not sender or not receiver or amount <= 0:
-        return jsonify({"error": "Invalid transaction format"}), 400
+    if not all([sender, receiver, amount > 0, timestamp, signature, pubkey_hex]):
+        return jsonify({"error": "Invalid transaction fields"}), 400
+
+    if not verify_signature(tx):
+        return jsonify({"error": "Invalid signature or sender mismatch"}), 403
 
     sender_balance = ledger_data["balances"].get(sender, 0.0)
     if sender_balance < amount:
@@ -64,7 +88,51 @@ def submit_transaction():
     ledger_data["ledger"].append(tx)
     with open(LEDGER_FILE, 'w') as f:
         json.dump(ledger_data, f)
+
     return jsonify({"status": "accepted", "tx": tx})
+
+@app.route("/validate_tx", methods=["POST"])
+def validate_transaction():
+    tx = request.json
+    valid = verify_signature(tx)
+    return jsonify({"valid": valid})
+
+@app.route("/faucet", methods=["POST"])
+def faucet():
+    data = request.get_json()
+    address = data.get("address")
+    amount = float(data.get("amount", 0))
+    timestamp = data.get("timestamp")
+    signature = data.get("signature")
+    pubkey_hex = data.get("pubkey")
+
+    if not all([address, amount > 0, timestamp, signature, pubkey_hex]):
+        return jsonify({"error": "Invalid request"}), 400
+
+    faucet_tx = {
+        "sender": TREASURY_ADDR,
+        "receiver": address,
+        "amount": amount,
+        "timestamp": timestamp,
+        "signature": signature,
+        "pubkey": pubkey_hex
+    }
+
+    if not verify_signature(faucet_tx):
+        return jsonify({"error": "Invalid faucet signature"}), 403
+
+    treasury = ledger_data["balances"].get(TREASURY_ADDR, 0)
+    if treasury < amount:
+        return jsonify({"error": "Insufficient treasury funds"}), 403
+
+    ledger_data["balances"][TREASURY_ADDR] -= amount
+    ledger_data["balances"][address] = ledger_data["balances"].get(address, 0) + amount
+
+    faucet_tx["type"] = "faucet"
+    ledger_data["ledger"].append(faucet_tx)
+    with open(LEDGER_FILE, 'w') as f:
+        json.dump(ledger_data, f)
+    return jsonify({"status": "faucet granted", "tx": faucet_tx})
 
 @app.route("/mine", methods=["POST"])
 def mine_block():
@@ -138,34 +206,6 @@ def get_indexed():
 @app.route("/balance/<address>", methods=["GET"])
 def get_balance(address):
     return jsonify({"address": address, "balance": ledger_data["balances"].get(address, 0.0)})
-
-@app.route("/faucet", methods=["POST"])
-def faucet():
-    data = request.get_json()
-    address = data.get("address")
-    amount = float(data.get("amount", 0))
-
-    if not address or amount <= 0:
-        return jsonify({"error": "Invalid request"}), 400
-
-    treasury = ledger_data["balances"].get(TREASURY_ADDR, 0)
-    if treasury < amount:
-        return jsonify({"error": "Insufficient treasury funds"}), 403
-
-    ledger_data["balances"][TREASURY_ADDR] -= amount
-    ledger_data["balances"][address] = ledger_data["balances"].get(address, 0) + amount
-
-    faucet_tx = {
-        "sender": TREASURY_ADDR,
-        "receiver": address,
-        "amount": amount,
-        "timestamp": time.time(),
-        "type": "faucet"
-    }
-    ledger_data["ledger"].append(faucet_tx)
-    with open(LEDGER_FILE, 'w') as f:
-        json.dump(ledger_data, f)
-    return jsonify({"status": "faucet granted", "tx": faucet_tx})
 
 if __name__ == '__main__':
     import sys
